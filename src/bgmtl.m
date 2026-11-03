@@ -1487,6 +1487,7 @@ bg_pipeline_queue(void)
 }
 - (dispatch_queue_t)completionQueue { return _completionQueue; }
 - (void)setGPUPriority:(double)p { (void)p; }   // MTLCommandQueueSPI: accepted, not enforced
+- (void)setResponsibleProcess:(int)pid { (void)pid; }   // MTLCommandQueueSPI: accepted; CA sent this twice post-registration and survived a zero, but answer it properly
 - (void)dealloc
 {
    if (_completionQueue) dispatch_release(_completionQueue);
@@ -1676,7 +1677,7 @@ bg_cmdbuf_done(void *ctx, int status, const char *why)
       if (_status != 5 && !defer_scheduled) _status = 3;
       uint64_t t_flushed = clock_gettime_nsec_np(CLOCK_MONOTONIC);
       if (!defer_scheduled) {
-         if (_queue->_completionQueue) { dispatch_sync(_queue->_completionQueue, ^{ for (void (^h)(id) in _scheduled) h(self); }); }
+         if (_queue->_completionQueue) { dispatch_async(_queue->_completionQueue, ^{ for (void (^h)(id) in _scheduled) h(self); }); }   // async: sync here can wedge the commit thread against CA's serial queue
          else { for (void (^h)(id) in _scheduled) h(self); }
          [_scheduled removeAllObjects];
       }
@@ -1696,7 +1697,7 @@ bg_cmdbuf_done(void *ctx, int status, const char *why)
          return;   // bg_cmdbuf_done ran with the failure
       ctx->t_flushed = clock_gettime_nsec_np(CLOCK_MONOTONIC);
       if (!defer_scheduled) {
-         if (_queue->_completionQueue) { dispatch_sync(_queue->_completionQueue, ^{ for (void (^h)(id) in _scheduled) h(self); }); }
+         if (_queue->_completionQueue) { dispatch_async(_queue->_completionQueue, ^{ for (void (^h)(id) in _scheduled) h(self); }); }   // async: sync here can wedge the commit thread against CA's serial queue
          else { for (void (^h)(id) in _scheduled) h(self); }
          [_scheduled removeAllObjects];
       }
@@ -1737,7 +1738,7 @@ bg_idle_trim_schedule(void)
 - (void)bgCompleteFrom:(uint64_t)t_begin
 {
    bg_return_slot(self, _queue);
-   if (_queue->_completionQueue) { dispatch_sync(_queue->_completionQueue, ^{ for (void (^h)(id) in _scheduled) h(self); }); } // left here by the compositor's deferral (see commit)
+   if (_queue->_completionQueue) { dispatch_async(_queue->_completionQueue, ^{ for (void (^h)(id) in _scheduled) h(self); }); }   // async: sync here can wedge the commit thread against CA's serial queue // left here by the compositor's deferral (see commit)
    else { for (void (^h)(id) in _scheduled) h(self); }
    [_scheduled removeAllObjects];
    // buffer-backed textures: the GPU's result goes back into their buffers before any completed handler reads them
@@ -1786,7 +1787,7 @@ bg_idle_trim_schedule(void)
    [_written removeAllObjects];
    if (_queue->_completionQueue) {   // MTLCommandQueueSPI: handlers run on Metal's queue
       dispatch_queue_t cq = _queue->_completionQueue;
-      dispatch_sync(cq, ^{ for (void (^h)(id) in _completed) h(self); });
+      dispatch_async(cq, ^{ for (void (^h)(id) in _completed) h(self); });   // async: the completion thread must never wait on CA's queue
    } else {
       for (void (^h)(id) in _completed) h(self);
    }
