@@ -304,10 +304,13 @@ bg_texpool_put(struct chl_device *dev, struct chl_texture *tex, const struct chl
       free_k = -1;
       for (unsigned k = 0; k < BG_TEXPOOL_SLOTS; k++) {
          if (!g_texpool[k].tex) { if (free_k < 0) free_k = (int)k; }
-         else if (old_k < 0 || g_texpool[k].t < g_texpool[old_k].t) old_k = (int)k;
+         // art13: only entries idle at least 1 s are eviction candidates — under load the LRU can be milliseconds
+         // old and still referenced by an executing command buffer (2026-11-04: the ungated pool faulted 8× in 90 s
+         // of swiping; the same load with the pool off ran a fault-free 160 s)
+         else if (now - g_texpool[k].t > 1000000000ull && (old_k < 0 || g_texpool[k].t < g_texpool[old_k].t)) old_k = (int)k;
       }
       if (free_k >= 0 && g_texpool_bytes + bytes <= cap) break;
-      if (old_k < 0) { os_unfair_lock_unlock(&g_texpool_lock); return NO; }
+      if (old_k < 0) { os_unfair_lock_unlock(&g_texpool_lock); return NO; }   // nothing old enough: a normal release, not a pool drop
       bg_texpool_drop((unsigned)old_k);   // the oldest makes room
    }
    g_texpool[free_k].dev = dev;
