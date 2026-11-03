@@ -498,6 +498,7 @@ bg_install_fallback(Class c)
 
 @interface BGMTLCommandQueue : _MTLCommandQueue {
    BGMTLDevice *_owner;
+ @public
    dispatch_queue_t _completionQueue;   // MTLCommandQueueSPI setCompletionQueue: (see -setCompletionQueue: below)
 }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(id)descriptor;
@@ -1481,7 +1482,8 @@ bg_pipeline_queue(void)
 {
    if (q == _completionQueue) return;
    if (_completionQueue) dispatch_release(_completionQueue);
-   _completionQueue = q ? dispatch_retain(q) : NULL;
+   if (q) dispatch_retain(q);   // modern SDKs: dispatch_retain returns void
+   _completionQueue = q;
 }
 - (dispatch_queue_t)completionQueue { return _completionQueue; }
 - (void)setGPUPriority:(double)p { (void)p; }   // MTLCommandQueueSPI: accepted, not enforced
