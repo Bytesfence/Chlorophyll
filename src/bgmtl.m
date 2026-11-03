@@ -634,10 +634,19 @@ ensure_protocol(Class cls, const char *proto)
       BG_LOG("class_addProtocol(%s) refused for %s\n", proto, class_getName(cls));
 }
 
+// art6 (2a058f5) died at setup: an ObjC exception thrown through Foundation/BaseBoard on backboardd's main thread
+// (sig 6, objc_exception_throw). The signal handler cannot see the exception; this one can, and it names the thrower.
+static void bg_uncaught_exception(NSException *ex)
+{
+   BG_LOG("UNCAUGHT EXCEPTION name [%s] reason [%s]\n", [[ex name] UTF8String], [[ex reason] UTF8String]);
+   for (NSString *frame in [ex callStackSymbols]) BG_LOG("  %s\n", [frame UTF8String]);
+}
+
 @implementation BGMTLDevice
 
 + (void)load
 {
+   NSSetUncaughtExceptionHandler(bg_uncaught_exception);   // name any future exception in bgmtl.log before the abort
    // MTLDeviceSPI is the private protocol Metal's registration asserts on; we never register, but a subclass that claims
    // to be a device has to conform, and the whole SPI surface is answered by _MTLDevice's own defaults or by methods below.
    ensure_protocol(self, "MTLDeviceSPI");
@@ -1485,9 +1494,11 @@ bg_pipeline_queue(void)
    if (q) dispatch_retain(q);   // modern SDKs: dispatch_retain returns void
    _completionQueue = q;
 }
-- (dispatch_queue_t)completionQueue { return _completionQueue; }
+- (dispatch_queue_t)completionQueue { return [[_completionQueue retain] autorelease]; }   // MRC getter: callers may release the return
 - (void)setGPUPriority:(double)p { (void)p; }   // MTLCommandQueueSPI: accepted, not enforced
-- (void)setResponsibleProcess:(int)pid { (void)pid; }   // MTLCommandQueueSPI: accepted; CA sent this twice post-registration and survived a zero, but answer it properly
+// setResponsibleProcess: deliberately NOT implemented here: art6 (2a058f5) added an (int) no-op and backboardd died at
+// setup with an ObjC exception thrown through Foundation/BaseBoard (sig 6, objc_exception_throw, main thread); the
+// answered-with-zero path (art5 c4f4c70) survived the same probes twice. Reverted until the exception handler names the thrower.
 - (void)dealloc
 {
    if (_completionQueue) dispatch_release(_completionQueue);
@@ -1677,7 +1688,7 @@ bg_cmdbuf_done(void *ctx, int status, const char *why)
       if (_status != 5 && !defer_scheduled) _status = 3;
       uint64_t t_flushed = clock_gettime_nsec_np(CLOCK_MONOTONIC);
       if (!defer_scheduled) {
-         if (_queue->_completionQueue) { dispatch_async(_queue->_completionQueue, ^{ for (void (^h)(id) in _scheduled) h(self); }); }   // async: sync here can wedge the commit thread against CA's serial queue
+         if (_queue->_completionQueue) { NSArray *bg_snapshot = [[_scheduled copy] autorelease]; dispatch_async(_queue->_completionQueue, ^{ for (void (^h)(id) in bg_snapshot) h(self); }); }   // snapshot: _scheduled is drained below before this block runs; async: never block on CA's serial queue
          else { for (void (^h)(id) in _scheduled) h(self); }
          [_scheduled removeAllObjects];
       }
@@ -1697,7 +1708,7 @@ bg_cmdbuf_done(void *ctx, int status, const char *why)
          return;   // bg_cmdbuf_done ran with the failure
       ctx->t_flushed = clock_gettime_nsec_np(CLOCK_MONOTONIC);
       if (!defer_scheduled) {
-         if (_queue->_completionQueue) { dispatch_async(_queue->_completionQueue, ^{ for (void (^h)(id) in _scheduled) h(self); }); }   // async: sync here can wedge the commit thread against CA's serial queue
+         if (_queue->_completionQueue) { NSArray *bg_snapshot = [[_scheduled copy] autorelease]; dispatch_async(_queue->_completionQueue, ^{ for (void (^h)(id) in bg_snapshot) h(self); }); }   // snapshot: _scheduled is drained below before this block runs; async: never block on CA's serial queue
          else { for (void (^h)(id) in _scheduled) h(self); }
          [_scheduled removeAllObjects];
       }
@@ -1738,7 +1749,7 @@ bg_idle_trim_schedule(void)
 - (void)bgCompleteFrom:(uint64_t)t_begin
 {
    bg_return_slot(self, _queue);
-   if (_queue->_completionQueue) { dispatch_async(_queue->_completionQueue, ^{ for (void (^h)(id) in _scheduled) h(self); }); }   // async: sync here can wedge the commit thread against CA's serial queue // left here by the compositor's deferral (see commit)
+   if (_queue->_completionQueue) { NSArray *bg_snapshot = [[_scheduled copy] autorelease]; dispatch_async(_queue->_completionQueue, ^{ for (void (^h)(id) in bg_snapshot) h(self); }); }   // snapshot: _scheduled is drained below before this block runs; async: never block on CA's serial queue // left here by the compositor's deferral (see commit)
    else { for (void (^h)(id) in _scheduled) h(self); }
    [_scheduled removeAllObjects];
    // buffer-backed textures: the GPU's result goes back into their buffers before any completed handler reads them
@@ -1787,7 +1798,8 @@ bg_idle_trim_schedule(void)
    [_written removeAllObjects];
    if (_queue->_completionQueue) {   // MTLCommandQueueSPI: handlers run on Metal's queue
       dispatch_queue_t cq = _queue->_completionQueue;
-      dispatch_async(cq, ^{ for (void (^h)(id) in _completed) h(self); });   // async: the completion thread must never wait on CA's queue
+      NSArray *bg_completed_snapshot = [[_completed copy] autorelease];
+      dispatch_async(cq, ^{ for (void (^h)(id) in bg_completed_snapshot) h(self); });   // async: the completion thread must never wait on CA's queue
    } else {
       for (void (^h)(id) in _completed) h(self);
    }
