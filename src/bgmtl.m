@@ -1688,7 +1688,7 @@ bg_cmdbuf_done(void *ctx, int status, const char *why)
       if (_status != 5 && !defer_scheduled) _status = 3;
       uint64_t t_flushed = clock_gettime_nsec_np(CLOCK_MONOTONIC);
       if (!defer_scheduled) {
-         if (_queue->_completionQueue) { NSArray *bg_snapshot = [[_scheduled copy] autorelease]; dispatch_async(_queue->_completionQueue, ^{ for (void (^h)(id) in bg_snapshot) h(self); }); }   // snapshot: _scheduled is drained below before this block runs; async: never block on CA's serial queue
+         if (_queue->_completionQueue) { NSArray *bg_snapshot = [[_scheduled copy] autorelease]; dispatch_sync(_queue->_completionQueue, ^{ for (void (^h)(id) in bg_snapshot) h(self); }); }   // SYNC (art8): CA checks scheduled-handler bookkeeping right after commit returns (art6/7 async aborted here via Foundation +68196); snapshot still guards the drain below
          else { for (void (^h)(id) in _scheduled) h(self); }
          [_scheduled removeAllObjects];
       }
@@ -1708,7 +1708,7 @@ bg_cmdbuf_done(void *ctx, int status, const char *why)
          return;   // bg_cmdbuf_done ran with the failure
       ctx->t_flushed = clock_gettime_nsec_np(CLOCK_MONOTONIC);
       if (!defer_scheduled) {
-         if (_queue->_completionQueue) { NSArray *bg_snapshot = [[_scheduled copy] autorelease]; dispatch_async(_queue->_completionQueue, ^{ for (void (^h)(id) in bg_snapshot) h(self); }); }   // snapshot: _scheduled is drained below before this block runs; async: never block on CA's serial queue
+         if (_queue->_completionQueue) { NSArray *bg_snapshot = [[_scheduled copy] autorelease]; dispatch_sync(_queue->_completionQueue, ^{ for (void (^h)(id) in bg_snapshot) h(self); }); }   // SYNC (art8): CA checks scheduled-handler bookkeeping right after commit returns (art6/7 async aborted here via Foundation +68196); snapshot still guards the drain below
          else { for (void (^h)(id) in _scheduled) h(self); }
          [_scheduled removeAllObjects];
       }
@@ -1749,7 +1749,7 @@ bg_idle_trim_schedule(void)
 - (void)bgCompleteFrom:(uint64_t)t_begin
 {
    bg_return_slot(self, _queue);
-   if (_queue->_completionQueue) { NSArray *bg_snapshot = [[_scheduled copy] autorelease]; dispatch_async(_queue->_completionQueue, ^{ for (void (^h)(id) in bg_snapshot) h(self); }); }   // snapshot: _scheduled is drained below before this block runs; async: never block on CA's serial queue // left here by the compositor's deferral (see commit)
+   if (_queue->_completionQueue) { NSArray *bg_snapshot = [[_scheduled copy] autorelease]; dispatch_async(_queue->_completionQueue, ^{ for (void (^h)(id) in bg_snapshot) h(self); }); } // ASYNC (art8): deferred drain runs on the completion thread — sync here was art5's worker-abort candidate; left by the compositor's deferral (see commit)
    else { for (void (^h)(id) in _scheduled) h(self); }
    [_scheduled removeAllObjects];
    // buffer-backed textures: the GPU's result goes back into their buffers before any completed handler reads them
