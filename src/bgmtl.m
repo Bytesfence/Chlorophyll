@@ -498,6 +498,7 @@ bg_install_fallback(Class c)
 
 @interface BGMTLCommandQueue : _MTLCommandQueue {
    BGMTLDevice *_owner;
+   dispatch_queue_t _completionQueue;   // MTLCommandQueueSPI setCompletionQueue: (see -setCompletionQueue: below)
 }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(id)descriptor;
 @end
@@ -648,6 +649,9 @@ ensure_protocol(Class cls, const char *proto)
    for (unsigned i = 0; i < sizeof(fb) / sizeof(fb[0]); i++) {
       if (fb[i]) bg_install_fallback(fb[i]);
    }
+   // MTLCommandQueueSPI is what Metal probes on the queue right after creation (setCompletionQueue: first);
+   // claiming conformance up front keeps protocol checks happy while the real methods above answer the rest
+   ensure_protocol([BGMTLCommandQueue class], "MTLCommandQueueSPI");
 }
 
 - (instancetype)initWithAcceleratorPort:(uint32_t)port
@@ -813,6 +817,10 @@ ensure_protocol(Class cls, const char *proto)
 // submit to this GPU. QuartzCore 26 references MTL4CommandQueue (signalEvent:value:/waitForEvent:value:), so every query
 // says NO and every factory returns nil here. iOS 18 never sends these selectors.
 - (BOOL)supportsMTL4CommandQueue { BG_TRACE("supportsMTL4CommandQueue -> NO\n"); return NO; }
+// MTLDeviceSPI probes CoreAnimation makes during bring-up: attribution and priority. Accepted, ignored —
+// answered-zero is what the forwarding fallback does, but a real (void) answer keeps the SPI surface clean.
+- (void)setResponsibleProcess:(id)p { (void)p; }
+- (void)setGPUPriority:(double)p { (void)p; }
 - (BOOL)supportsMTL4CommandAllocator { return NO; }
 - (BOOL)supportsMTL4Compiler { return NO; }
 - (BOOL)supportsMTL4ComputeCommandEncoder { return NO; }
@@ -1465,6 +1473,23 @@ bg_pipeline_queue(void)
 // CoreAnimation asks with a descriptor; _MTLCommandQueue's default would hand back a generic command buffer that never reaches the GPU
 - (id)commandBufferWithDescriptor:(id)d { (void)d; return [self commandBuffer]; }
 - (void)insertDebugCaptureBoundary {}
+// MTLCommandQueueSPI (private): Metal hands the queue a dispatch queue on which scheduled/completed handlers must run
+// (the peer port project found the same chain: MTLAddDevice asserts MTLDeviceSPI, then the queue gets setCompletionQueue:).
+// Left unanswered, CoreAnimation's frame loop loses completion feedback after the first frames and stops submitting:
+// software compositing at ~3 fps, zero GPU submits while swiping (2026-11-03).
+- (void)setCompletionQueue:(dispatch_queue_t)q
+{
+   if (q == _completionQueue) return;
+   if (_completionQueue) dispatch_release(_completionQueue);
+   _completionQueue = q ? dispatch_retain(q) : NULL;
+}
+- (dispatch_queue_t)completionQueue { return _completionQueue; }
+- (void)setGPUPriority:(double)p { (void)p; }   // MTLCommandQueueSPI: accepted, not enforced
+- (void)dealloc
+{
+   if (_completionQueue) dispatch_release(_completionQueue);
+   [super dealloc];
+}
 @end
 
 @implementation BGMTLCommandBuffer
@@ -1648,7 +1673,11 @@ bg_cmdbuf_done(void *ctx, int status, const char *why)
       if (chl_cmdbuf_commit(_ccb, NULL, NULL, why, sizeof(why)) != 0) [self bgFailWith:[NSString stringWithUTF8String:why] code:2];
       if (_status != 5 && !defer_scheduled) _status = 3;
       uint64_t t_flushed = clock_gettime_nsec_np(CLOCK_MONOTONIC);
-      if (!defer_scheduled) { for (void (^h)(id) in _scheduled) h(self); [_scheduled removeAllObjects]; }
+      if (!defer_scheduled) {
+         if (_queue->_completionQueue) { dispatch_sync(_queue->_completionQueue, ^{ for (void (^h)(id) in _scheduled) h(self); }); }
+         else { for (void (^h)(id) in _scheduled) h(self); }
+         [_scheduled removeAllObjects];
+      }
       if (_status != 5 && chl_cmdbuf_wait(_ccb, why, sizeof(why)) != 0) [self bgFailWith:[NSString stringWithUTF8String:why] code:3];
       else if (_status != 5) _status = 4;
       bg_perf_note(_t_first, t_begin, t_flushed, clock_gettime_nsec_np(CLOCK_MONOTONIC), _draws);
@@ -1664,7 +1693,11 @@ bg_cmdbuf_done(void *ctx, int status, const char *why)
       if (chl_cmdbuf_commit(_ccb, bg_cmdbuf_done, ctx, why, sizeof(why)) != 0)
          return;   // bg_cmdbuf_done ran with the failure
       ctx->t_flushed = clock_gettime_nsec_np(CLOCK_MONOTONIC);
-      if (!defer_scheduled) { for (void (^h)(id) in _scheduled) h(self); [_scheduled removeAllObjects]; }
+      if (!defer_scheduled) {
+         if (_queue->_completionQueue) { dispatch_sync(_queue->_completionQueue, ^{ for (void (^h)(id) in _scheduled) h(self); }); }
+         else { for (void (^h)(id) in _scheduled) h(self); }
+         [_scheduled removeAllObjects];
+      }
       return;
    }
    [self bgCompleteFrom:t_begin];
@@ -1702,7 +1735,8 @@ bg_idle_trim_schedule(void)
 - (void)bgCompleteFrom:(uint64_t)t_begin
 {
    bg_return_slot(self, _queue);
-   for (void (^h)(id) in _scheduled) h(self);    // left here by the compositor's deferral (see commit)
+   if (_queue->_completionQueue) { dispatch_sync(_queue->_completionQueue, ^{ for (void (^h)(id) in _scheduled) h(self); }); } // left here by the compositor's deferral (see commit)
+   else { for (void (^h)(id) in _scheduled) h(self); }
    [_scheduled removeAllObjects];
    // buffer-backed textures: the GPU's result goes back into their buffers before any completed handler reads them
    for (BGMTLTexture *t in _linWritten) {
@@ -1748,7 +1782,12 @@ bg_idle_trim_schedule(void)
    }
    [_presents removeAllObjects];
    [_written removeAllObjects];
-   for (void (^h)(id) in _completed) h(self);
+   if (_queue->_completionQueue) {   // MTLCommandQueueSPI: handlers run on Metal's queue
+      dispatch_queue_t cq = _queue->_completionQueue;
+      dispatch_sync(cq, ^{ for (void (^h)(id) in _completed) h(self); });
+   } else {
+      for (void (^h)(id) in _completed) h(self);
+   }
    [_completed removeAllObjects];
    bg_idle_trim_schedule();
 }
