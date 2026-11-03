@@ -330,6 +330,7 @@ __attribute__((weak)) void bgmtl_note_completed(void) {}   // a command buffer f
 __attribute__((weak)) void bgmtl_note_committed(void) {}   // a command buffer was committed (starts the injection's dead-man clock)
 __attribute__((weak)) void bgmtl_note_line(const char *line) { (void)line; }   // one diagnostic line, logged by the injection dylib
 __attribute__((weak)) void bgmtl_note_present(const char *line) { (void)line; }   // per-present diagnostics, logged (rate-limited) by the injection dylib
+__attribute__((weak)) void bgmtl_note_frames(double fps) { (void)fps; }   // per-second frame-rate telemetry, acted on by the injection dylib
 
 // Chlorophyll: where a slow start goes (/private/var/tmp/bgmtl.perf at process start): pipeline builds and single commits that
 // take long. Totals are logged every 16 pipelines and any single wait over 100 ms is logged at once.
@@ -1655,6 +1656,7 @@ bg_perf_note(uint64_t t_first, uint64_t t_begin, uint64_t t_flushed, uint64_t t_
                   "<=100 %llu", burst_frames * 1e9 / burst_ns, (unsigned long long)burst_frames, burst_ns / 1e6,
                   (unsigned long long)bin[0], (unsigned long long)bin[1], (unsigned long long)bin[2], (unsigned long long)bin[3]);
          bgmtl_note_line(line);
+         bgmtl_note_frames(burst_frames * 1e9 / burst_ns);   // art12: the inject watches for the post-fault 10 Hz clamp
       }
       if (bg_texpool_cap()) {
          snprintf(line, sizeof(line), "texpool: %lu hits, %lu misses, %.1f MB held", g_texpool_hits, g_texpool_misses,

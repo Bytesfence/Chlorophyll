@@ -256,10 +256,47 @@ trip_soft(const char *why)
    }
    FILE *w = fopen(trips, "w");
    if (w) { fprintf(w, "boot=%s count=%lu t=%lu\n", boot_id(), count, (unsigned long)time(NULL)); fclose(w); }
+   unlink("/private/var/tmp/bgmtl-bb.wind");   // art12: a new fault cycle earns a new second wind
    if (count >= 3) { trip(why); return; }
    ilog("DEAD-MAN%s SOFT: %s: death %lu/3 in this window: exiting WITHOUT the kill switch (respawn re-engages)",
         g_bb ? " (backboardd)" : "", why, count);
    _exit(0);
+}
+
+// art12: the second wind. A respawn straight after a soft-trip engages into post-fault chaos and CoreAnimation
+// locks its frame pacing at 10 Hz for the life of the process — measured repeatedly tonight, both directions:
+// engage into calm = 60 fps ([431] after a settled catch), engage into chaos = 10 fps ([683] right after the
+// soft-trip, [64] at boot), and one more restart while calm restores the full rate. So when this launch follows
+// a soft-trip and the telemetry still shows the clamp after 25 s of animation, exit cleanly exactly once —
+// launchd's respawn then engages into the settled system. The wind marker (boot-scoped, cleared by each new
+// soft-trip) bounds it to one attempt per fault cycle; a clean _exit(0) does not touch the unclean-launch
+// counter (proven: [683] engaged normally after [431]'s soft exit).
+void
+bgmtl_note_frames(double fps)
+{
+#define F_BB_WIND "/private/var/tmp/bgmtl-bb.wind"
+   static uint64_t clamp_since;
+   if (!g_bb || fps <= 0.0) return;
+   char wb[80] = "";
+   FILE *f = fopen(F_BB_WIND, "r");
+   if (f) { if (fscanf(f, "boot=%79s", wb) != 1) wb[0] = '\0'; fclose(f); }
+   if (wb[0] && strcmp(wb, boot_id()) == 0) return;   // already had this boot-cycle's second wind
+   unsigned long t = 0; char pb[80] = "";
+   f = fopen("/private/var/tmp/bgmtl-bb.state.trips", "r");
+   if (!f) return;
+   int recent = fscanf(f, "boot=%79s count=%*u t=%lu", pb, &t) == 2 && strcmp(pb, boot_id()) == 0 &&
+                t && (unsigned long)time(NULL) - t < 300;
+   fclose(f);
+   if (!recent) { clamp_since = 0; return; }
+   if (fps >= 15.0) { clamp_since = 0; return; }
+   uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+   if (clamp_since == 0) { clamp_since = now; return; }
+   if (now - clamp_since < 25000000000ull) return;
+   FILE *w = fopen(F_BB_WIND, "w");
+   if (w) { fprintf(w, "boot=%s\n", boot_id()); fclose(w); }
+   ilog("SECOND WIND: %.1f fps clamp persists 25 s after a soft-trip: one clean restart into the settled system", fps);
+   _exit(0);
+#undef F_BB_WIND
 }
 
 // backboardd: the stricter watchdog (see the header)
@@ -456,6 +493,11 @@ __attribute__((constructor)) static void
 bgmtl_inject_init(void)
 {
    @autoreleasepool {
+      // art12: a respawn right after a soft-trip can lock CoreAnimation's pacing at 10 Hz for the life of the
+      // process (measured: engage calm = 60 fps, engage into post-fault chaos = 10 fps, same binary, and one
+      // more restart while calm restores 60). The second wind is self-administered from bgmtl.m's frame
+      // telemetry (see bgmtl_note_frames); nothing delays this process's start here — a constructor sleep
+      // would black-screen the phone (no compositor at all while it ran).
       if (!strcmp(getprogname(), "backboardd")) bb_env();
       // bgl-launch chose Metal for this launch; on iOS 26 there is no bgl-launch (and dyld ignores DYLD_* for backboardd), so the
       // inject is weakly linked into a re-signed backboardd and /private/var/tmp/bgmtl-bb.direct stands in for BGMTL_BB=1
