@@ -1141,7 +1141,18 @@ bg_air_slice(NSData *d)
    char why[512] = { 0 };
    struct chl_pipeline_info info;
    uint64_t pt0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
-   struct chl_render_pipeline *r = chl_render_pipeline_create(_dev, &pd, &info, why, sizeof(why));
+   struct chl_render_pipeline *r = NULL;
+   for (unsigned attempt = 0; attempt < 3 && !r; attempt++) {   // art9: vkCreateGraphicsPipelines can answer VK_ERROR_OUT_OF_DEVICE_MEMORY
+      if (attempt) {                                            // transiently at boot (contention); CA kills us on the first failure,
+         char line[256];                                        // so log it and give the allocator time to settle before retrying
+         snprintf(line, sizeof(line), "render pipeline %s + %s: attempt %u failed (%s), retrying",
+                  [[vertex name] UTF8String], fragment ? [[fragment name] UTF8String] : "-", attempt, why);
+         bgmtl_note_line(line);
+         usleep(300000);
+      }
+      why[0] = 0;
+      r = chl_render_pipeline_create(_dev, &pd, &info, why, sizeof(why));
+   }
    uint64_t pt1 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
    if (bg_perf_on()) {
       static uint64_t n, buildns;
@@ -1185,7 +1196,18 @@ bg_air_slice(NSData *d)
    char why[512] = { 0 };
    struct chl_pipeline_info info;
    struct chl_function fn = { air.bytes, air.length, [[function name] UTF8String], NULL, 0, NULL, 0 };
-   struct chl_compute_pipeline *c = chl_compute_pipeline_create(_dev, &fn, &info, why, sizeof(why));
+   struct chl_compute_pipeline *c = NULL;
+   for (unsigned attempt = 0; attempt < 3 && !c; attempt++) {   // art9: same transient OUT_OF_DEVICE_MEMORY retry as render pipelines
+      if (attempt) {
+         char line[256];
+         snprintf(line, sizeof(line), "compute pipeline %s: attempt %u failed (%s), retrying",
+                  [[function name] UTF8String], attempt, why);
+         bgmtl_note_line(line);
+         usleep(300000);
+      }
+      why[0] = 0;
+      c = chl_compute_pipeline_create(_dev, &fn, &info, why, sizeof(why));
+   }
    if (!c) {
       bg_fail_dump(why, nil, nil, air, [function name], "c");
       return [self bgFail:error with:[NSString stringWithUTF8String:why]];
@@ -1494,7 +1516,7 @@ bg_pipeline_queue(void)
    if (q) dispatch_retain(q);   // modern SDKs: dispatch_retain returns void
    _completionQueue = q;
 }
-- (dispatch_queue_t)completionQueue { return [[_completionQueue retain] autorelease]; }   // MRC getter: callers may release the return
+- (dispatch_queue_t)completionQueue { return (dispatch_queue_t)[[(id)_completionQueue retain] autorelease]; }   // MRC getter: callers may release the return
 - (void)setGPUPriority:(double)p { (void)p; }   // MTLCommandQueueSPI: accepted, not enforced
 // setResponsibleProcess: deliberately NOT implemented here: art6 (2a058f5) added an (int) no-op and backboardd died at
 // setup with an ObjC exception thrown through Foundation/BaseBoard (sig 6, objc_exception_throw, main thread); the
