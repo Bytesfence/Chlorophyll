@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
@@ -117,6 +118,9 @@ bb_state(int alive)
    fprintf(f, "alive=%d boot=%s\n", alive, boot_id());
    fclose(f);
 }
+
+static void trip(const char *why);
+static void trip_soft(const char *why);
 
 static void
 trip(const char *why)
@@ -227,7 +231,35 @@ bgmtl_note_failure(const char *why)
    int n = __sync_add_and_fetch(&g_failures, 1);
    ilog("command buffer failure %d: %s", n, why ? why : "?");
    if (n >= 3)
-      trip("3 failed command buffers");
+      trip_soft("3 failed command buffers");
+}
+
+// art11: a device lost after a kernel fault recovery is survivable — a fresh registration on the warm shader
+// cache is healthy again seconds later (measured: respawn + register + pipelines-from-cache ~10 s). So the
+// first deaths exit WITHOUT the kill switch and let launchd's respawn re-engage; only the third death inside
+// five minutes of the same boot is a loop and trips for real.
+static void
+trip_soft(const char *why)
+{
+   char trips[160];
+   snprintf(trips, sizeof(trips), "%s.trips", g_bb ? F_BB_STATE : g_state);
+   unsigned long count = 1, prev_t = 0;
+   char prev_boot[80] = "";
+   FILE *f = fopen(trips, "r");
+   if (f) {
+      if (fscanf(f, "boot=%79s count=%lu t=%lu", prev_boot, &count, &prev_t) == 3 &&
+          strcmp(prev_boot, boot_id()) == 0 && prev_t && (unsigned long)time(NULL) - prev_t < 300)
+         count++;
+      else
+         count = 1;
+      fclose(f);
+   }
+   FILE *w = fopen(trips, "w");
+   if (w) { fprintf(w, "boot=%s count=%lu t=%lu\n", boot_id(), count, (unsigned long)time(NULL)); fclose(w); }
+   if (count >= 3) { trip(why); return; }
+   ilog("DEAD-MAN%s SOFT: %s: death %lu/3 in this window: exiting WITHOUT the kill switch (respawn re-engages)",
+        g_bb ? " (backboardd)" : "", why, count);
+   _exit(0);
 }
 
 // backboardd: the stricter watchdog (see the header)
