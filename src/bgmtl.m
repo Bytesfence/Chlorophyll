@@ -1142,13 +1142,13 @@ bg_air_slice(NSData *d)
    struct chl_pipeline_info info;
    uint64_t pt0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
    struct chl_render_pipeline *r = NULL;
-   for (unsigned attempt = 0; attempt < 3 && !r; attempt++) {   // art9: vkCreateGraphicsPipelines can answer VK_ERROR_OUT_OF_DEVICE_MEMORY
-      if (attempt) {                                            // transiently at boot (contention); CA kills us on the first failure,
-         char line[256];                                        // so log it and give the allocator time to settle before retrying
+   for (unsigned attempt = 0; attempt < 5 && !r; attempt++) {   // art10: 5 x 800 ms — the cold-boot -2 window outlasted 3 x 300
+      if (attempt) {
+         char line[256];
          snprintf(line, sizeof(line), "render pipeline %s + %s: attempt %u failed (%s), retrying",
                   [[vertex name] UTF8String], fragment ? [[fragment name] UTF8String] : "-", attempt, why);
          bgmtl_note_line(line);
-         usleep(300000);
+         usleep(800000);
       }
       why[0] = 0;
       r = chl_render_pipeline_create(_dev, &pd, &info, why, sizeof(why));
@@ -1687,6 +1687,15 @@ bg_cmdbuf_done(void *ctx, int status, const char *why)
 
 - (void)commit
 {
+   {   // art10: bounded commit telemetry — what CA asks for, buffer by buffer, before the fallback
+      static unsigned n;
+      if (n++ < 40) {
+         char line[160];
+         snprintf(line, sizeof(line), "commit #%u: scheduled %u, completed %u, presents %u", n,
+                  (unsigned)[_scheduled count], (unsigned)[_completed count], (unsigned)[_presents count]);
+         bgmtl_note_line(line);
+      }
+   }
    __atomic_add_fetch(&g_bg_commit_seq, 1, __ATOMIC_RELAXED);
    bgmtl_note_committed();
    uint64_t t_begin = clock_gettime_nsec_np(CLOCK_MONOTONIC);
@@ -1770,6 +1779,15 @@ bg_idle_trim_schedule(void)
 // What follows a completed (or failed) command buffer; run on chl's completion thread, or inline when tracing.
 - (void)bgCompleteFrom:(uint64_t)t_begin
 {
+   {   // art10: bounded completion telemetry — did the GPU actually finish, and what came back
+      static unsigned n;
+      if (n++ < 40) {
+         char line[160];
+         snprintf(line, sizeof(line), "complete #%u: status %d, scheduled %u, completed %u, presents %u", n,
+                  (int)_status, (unsigned)[_scheduled count], (unsigned)[_completed count], (unsigned)[_presents count]);
+         bgmtl_note_line(line);
+      }
+   }
    bg_return_slot(self, _queue);
    if (_queue->_completionQueue) { NSArray *bg_snapshot = [[_scheduled copy] autorelease]; dispatch_async(_queue->_completionQueue, ^{ for (void (^h)(id) in bg_snapshot) h(self); }); } // ASYNC (art8): deferred drain runs on the completion thread — sync here was art5's worker-abort candidate; left by the compositor's deferral (see commit)
    else { for (void (^h)(id) in _scheduled) h(self); }
@@ -1805,6 +1823,14 @@ bg_idle_trim_schedule(void)
       snprintf(line, sizeof(line), "present: %u presents, %u draws, commit %.1f ms, at %.3f s", (unsigned)[_presents count], _draws,
                (t_end - t_begin) / 1e6, t_end / 1e9);
       bgmtl_note_present(line);
+      {   // art10: which drawable class the present goes to (bounded)
+         static unsigned pn;
+         if (pn++ < 40) {
+            char pline[200];
+            snprintf(pline, sizeof(pline), "present handoff #%u: drawable %s", pn, object_getClassName(_presents[0][0]));
+            bgmtl_note_line(pline);
+         }
+      }
    }
    if (_status == 4) bgmtl_note_completed();
    if (_status == 4) {
