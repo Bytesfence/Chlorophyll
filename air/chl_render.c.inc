@@ -331,6 +331,31 @@ chl_render_begin(struct chl_cmdbuf *cb, const struct chl_render_pass *pass, char
       w = lw ? lw : 1;
       h = lh ? lh : 1;
    }
+   /* Retain every attachment (and resolve target) for the life of the command buffer: the Metal
+    * side releases CA's per-frame offscreen targets (blur pyramid, glass, full-screen copies)
+    * right after recording, trusting "chl retains what it records" — which the bind, pipeline
+    * and blit paths do (cb_hold), but this pass-begin path never did. A released attachment
+    * tears down the IOSurface import's SMMU mapping while the GPU still renders into it: the
+    * SpringBoard icon/glass SMMU faults (2026-10-26 and 2026-11-04/05 boots, FARs in the GVM,
+    * GPU LOST after 3 recoveries) were exactly this. */
+   for (unsigned i = 0; i < 8; i++) {
+      const struct chl_attachment *a = &pass->color[i];
+      if (a->texture) {
+         cb_hold(cb, &a->texture->o);
+         if (a->resolve)
+            cb_hold(cb, &a->resolve->o);
+      }
+   }
+   if (pass->depth.texture) {
+      cb_hold(cb, &pass->depth.texture->o);
+      if (pass->depth.resolve)
+         cb_hold(cb, &pass->depth.resolve->o);
+   }
+   if (pass->stencil.texture) {
+      cb_hold(cb, &pass->stencil.texture->o);
+      if (pass->stencil.resolve)
+         cb_hold(cb, &pass->stencil.resolve->o);
+   }
    VkRenderingAttachmentInfo col[8], dep, sten;
    memset(cb->pass_color, 0, sizeof(cb->pass_color));
    for (unsigned i = 0; i < ncolor; i++) {
