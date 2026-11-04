@@ -537,8 +537,25 @@ pro_submit_locked(struct chl_device *d)
       for (unsigned i = 0; i < 8 && slot == 8; i++)
          if (!d->pro_inflight[i].fence)
             slot = i;
-      if (slot == 8)
-         return VK_ERROR_DEVICE_LOST;
+      if (slot == 8) {
+         /* Backpressure, not device death: a launch-time texture-upload storm
+          * (SpringBoard icons/images) can keep all 8 prologue fences unsignaled
+          * past CHL_FENCE_TIMEOUT_NS while the queue is merely busy. Block
+          * until ANY prologue retires; a truly dead device still fails at
+          * vkQueueSubmit below with a real VK_ERROR_DEVICE_LOST. */
+         VkFence fences[8];
+         uint32_t n = 0;
+         for (unsigned i = 0; i < 8; i++)
+            if (d->pro_inflight[i].fence)
+               fences[n++] = d->pro_inflight[i].fence;
+         (void)d->vk.vkWaitForFences(d->dev, n, fences, VK_FALSE, UINT64_MAX);
+         pro_reap(d, false);
+         for (unsigned i = 0; i < 8 && slot == 8; i++)
+            if (!d->pro_inflight[i].fence)
+               slot = i;
+         if (slot == 8)
+            return VK_ERROR_DEVICE_LOST; /* wedged even after an infinite wait */
+      }
    }
    VkFenceCreateInfo fi = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, 0 };
    VkFence fence;
