@@ -544,20 +544,24 @@ pro_submit_locked(struct chl_device *d)
          /* Backpressure, not device death: a launch-time texture-upload storm
           * (SpringBoard icons/images) can keep all 8 prologue fences unsignaled
           * past CHL_FENCE_TIMEOUT_NS while the queue is merely busy. Block
-          * until ANY prologue retires; a truly dead device still fails at
-          * vkQueueSubmit below with a real VK_ERROR_DEVICE_LOST. */
+          * until ANY prologue retires — but never forever: a HUNG GPU (CP stall,
+          * no SMMU fault, fence never signals) wedges the submit path for every
+          * process on the system (GPU state -1 bootwide, the 2026-11-05
+          * "gives out every boot" class). Six fence timeouts is far past any
+          * busy queue and short of forever; the slot==8 fallthrough below then
+          * reports VK_ERROR_DEVICE_LOST and the callers unwind cleanly. */
          VkFence fences[8];
          uint32_t n = 0;
          for (unsigned i = 0; i < 8; i++)
             if (d->pro_inflight[i].fence)
                fences[n++] = d->pro_inflight[i].fence;
-         (void)d->vk.vkWaitForFences(d->dev, n, fences, VK_FALSE, UINT64_MAX);
+         (void)d->vk.vkWaitForFences(d->dev, n, fences, VK_FALSE, 6 * CHL_FENCE_TIMEOUT_NS);
          pro_reap(d, false);
          for (unsigned i = 0; i < 8 && slot == 8; i++)
             if (!d->pro_inflight[i].fence)
                slot = i;
          if (slot == 8)
-            return VK_ERROR_DEVICE_LOST; /* wedged even after an infinite wait */
+            return VK_ERROR_DEVICE_LOST; /* wedged even after a finite backpressure wait */
       }
    }
    VkFenceCreateInfo fi = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, 0 };
