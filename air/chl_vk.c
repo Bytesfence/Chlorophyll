@@ -342,6 +342,9 @@ struct chl_cmdbuf {
    VkPipelineLayout pushed_layout[2];
    struct { VkDescriptorBufferInfo b; VkDescriptorImageInfo i; } pushed[2][AIR_VK_MAX_BINDINGS];
    uint32_t pushed_pc[2][64];
+   /* the same discipline for the per-draw state draw_prologue re-issued unconditionally */
+   bool restart, restart_set;
+   struct { VkBuffer b; VkDeviceSize o; } vbound[AIR_VK_BUFFER_SLOTS];
    bool vp_set, sc_set;
    struct chl_cmdbuf *next_free, *next_inflight;
 };
@@ -1916,6 +1919,10 @@ chl_cmdbuf_create(struct chl_device *d, char *why, size_t why_size)
    cb->ds = NULL;
    memset(cb->bind, 0, sizeof(cb->bind));
    memset(cb->tg_len, 0, sizeof(cb->tg_len));
+   /* a fresh recording: the caches of what the Vulkan command stream last saw start empty */
+   cb->pushed_layout[0] = cb->pushed_layout[1] = VK_NULL_HANDLE;
+   memset(cb->vbound, 0, sizeof(cb->vbound));
+   cb->restart_set = false;
    return cb;
 }
 
@@ -2130,7 +2137,16 @@ flush_bindings(struct chl_cmdbuf *cb, VkPipelineBindPoint bp, const struct chl_l
    VkDescriptorBufferInfo bi[32];
    VkDescriptorImageInfo ii[32];
    uint32_t push[64] = { 0 };
+   unsigned wbind[32];
+   bool wbuf[32];
    unsigned nw = 0;
+   /* the design the pushed/pushed_pc fields were built for: while the same layout stays pushed, a draw
+    * pushes only the descriptors and push constants that changed since the last one. The redundant
+    * full re-push per draw was the compositor's per-draw encode cost (184-draw composites at up to
+    * 112 ms). Turnip's push descriptors take partial writes per the spec: each write names its
+    * dstBinding; the untouched ones keep what the command stream already holds. */
+   const unsigned bpi = bp == VK_PIPELINE_BIND_POINT_COMPUTE;
+   const bool clean = cb->pushed_layout[bpi] == l->layout;
    for (unsigned i = 0; i < AIR_VK_MAX_BINDINGS; i++) {
       if (!l->bindings.type[i] || l->immutable[i])
          continue;
@@ -2141,8 +2157,8 @@ flush_bindings(struct chl_cmdbuf *cb, VkPipelineBindPoint bp, const struct chl_l
       unsigned stage = i / AIR_VK_STAGE_BINDINGS, local = i % AIR_VK_STAGE_BINDINGS;
       const struct chl_stage_bind *sb = &cb->bind[stage];
       VkDescriptorType t = (VkDescriptorType)(l->bindings.type[i] - 1);
-      w[nw] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, i, 0, 1, t, NULL, NULL, NULL };
-      if (local < AIR_VK_TEXTURE_BINDING) {
+      bool is_buf = local < AIR_VK_TEXTURE_BINDING;
+      if (is_buf) {
          unsigned n = local;
          struct chl_buffer *b = sb->buf[n];
          if (!b) {
@@ -2159,8 +2175,11 @@ flush_bindings(struct chl_cmdbuf *cb, VkPipelineBindPoint bp, const struct chl_l
          if (t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && range > d->props.limits.maxUniformBufferRange)
             range = d->props.limits.maxUniformBufferRange;
          bi[nw] = (VkDescriptorBufferInfo){ b->vk, aligned, range };
-         w[nw].pBufferInfo = &bi[nw];
          push[stage * 32 + n] = (uint32_t)(off - aligned);
+         if (clean && !memcmp(&cb->pushed[bpi][i].b, &bi[nw], sizeof(bi[nw])))
+            continue;
+         w[nw] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = i, .descriptorCount = 1,
+                                          .descriptorType = t, .pBufferInfo = &bi[nw] };
       } else if (local < AIR_VK_SAMPLER_BINDING) {
          unsigned n = local - AIR_VK_TEXTURE_BINDING;
          struct chl_texture *tx = sb->tex[n];
@@ -2173,7 +2192,10 @@ flush_bindings(struct chl_cmdbuf *cb, VkPipelineBindPoint bp, const struct chl_l
          if (tx)
             v = t == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? storage_view(tx, level) : tx->view;
          ii[nw] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, v, VK_IMAGE_LAYOUT_GENERAL };
-         w[nw].pImageInfo = &ii[nw];
+         if (clean && !memcmp(&cb->pushed[bpi][i].i, &ii[nw], sizeof(ii[nw])))
+            continue;
+         w[nw] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = i, .descriptorCount = 1,
+                                          .descriptorType = t, .pImageInfo = &ii[nw] };
       } else if (local >= AIR_VK_INPUT_BINDING) {
          /* a framebuffer fetch: the colour attachment itself (Turnip reads it from the attachment state, GMEM or sysmem;
           * the descriptor still has to name it) */
@@ -2183,13 +2205,21 @@ flush_bindings(struct chl_cmdbuf *cb, VkPipelineBindPoint bp, const struct chl_l
             return -1;
          }
          ii[nw] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, cb->pass_color[n], VK_IMAGE_LAYOUT_GENERAL };
-         w[nw].pImageInfo = &ii[nw];
+         if (clean && !memcmp(&cb->pushed[bpi][i].i, &ii[nw], sizeof(ii[nw])))
+            continue;
+         w[nw] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = i, .descriptorCount = 1,
+                                          .descriptorType = t, .pImageInfo = &ii[nw] };
       } else {
          unsigned n = local - AIR_VK_SAMPLER_BINDING;
          struct chl_sampler *s = sb->smp[n];
          ii[nw] = (VkDescriptorImageInfo){ s ? s->vk : d->default_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
-         w[nw].pImageInfo = &ii[nw];
+         if (clean && !memcmp(&cb->pushed[bpi][i].i, &ii[nw], sizeof(ii[nw])))
+            continue;
+         w[nw] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = i, .descriptorCount = 1,
+                                          .descriptorType = t, .pImageInfo = &ii[nw] };
       }
+      wbind[nw] = i;
+      wbuf[nw] = is_buf;
       nw++;
    }
    /* the null mask covers the texture slots of the stage the shader reads, bound or not */
@@ -2197,13 +2227,24 @@ flush_bindings(struct chl_cmdbuf *cb, VkPipelineBindPoint bp, const struct chl_l
       for (unsigned n = 0; n < AIR_VK_TEXTURE_SLOTS; n++)
          if (!cb->bind[stage].tex[n])
             push[stage * 32 + AIR_PUSH_NULL_MASK_WORD] |= 1u << n;
+   const unsigned pc_bytes = l->push_bytes ? (l->push_bytes + 3) & ~3u : 0;
+   const bool pc_clean = clean && pc_bytes && !memcmp(cb->pushed_pc[bpi], push, pc_bytes);
    if (nw)
       d->vk.vkCmdPushDescriptorSetKHR(cb->cb, bp, l->layout, 0, nw, w);
-   if (l->push_bytes)
+   if (l->push_bytes && !pc_clean)
       d->vk.vkCmdPushConstants(cb->cb, l->layout,
                                bp == VK_PIPELINE_BIND_POINT_COMPUTE ? VK_SHADER_STAGE_COMPUTE_BIT
                                                                     : VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                0, l->push_bytes, push);
+   cb->pushed_layout[bpi] = l->layout;
+   for (unsigned k = 0; k < nw; k++) {
+      if (wbuf[k])
+         cb->pushed[bpi][wbind[k]].b = bi[k];
+      else
+         cb->pushed[bpi][wbind[k]].i = ii[k];
+   }
+   if (pc_bytes)
+      memcpy(cb->pushed_pc[bpi], push, pc_bytes);
    return 0;
 }
 

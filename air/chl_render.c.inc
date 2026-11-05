@@ -479,8 +479,14 @@ draw_prologue(struct chl_cmdbuf *cb, unsigned mtl_primitive, bool indexed, char 
       cb->topology_set = true;
    }
    /* Metal restarts strips at the type's largest index, always */
-   d->vk.vkCmdSetPrimitiveRestartEnable(cb->cb, indexed && (mtl_primitive == 2 || mtl_primitive == 4));
-   /* vertex streams, from Metal's vertex buffer table */
+   const bool restart = indexed && (mtl_primitive == 2 || mtl_primitive == 4);
+   if (!cb->restart_set || cb->restart != restart) {
+      d->vk.vkCmdSetPrimitiveRestartEnable(cb->cb, restart);
+      cb->restart = restart;
+      cb->restart_set = true;
+   }
+   /* vertex streams, from Metal's vertex buffer table; the command stream keeps what an
+    * earlier draw in this recording bound to the same buffer+offset */
    for (unsigned i = 0; i < p->n_vbind; i++) {
       unsigned b = p->vbind[i].binding;
       struct chl_buffer *buf = cb->bind[0].buf[b];
@@ -489,7 +495,11 @@ draw_prologue(struct chl_cmdbuf *cb, unsigned mtl_primitive, bool indexed, char 
          return -1;
       }
       VkDeviceSize off = cb->bind[0].off[b];
+      if (cb->vbound[b].b == buf->vk && cb->vbound[b].o == off)
+         continue;
       d->vk.vkCmdBindVertexBuffers(cb->cb, b, 1, &buf->vk, &off);
+      cb->vbound[b].b = buf->vk;
+      cb->vbound[b].o = off;
    }
    return flush_bindings(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, &p->layout, why, why_size);
 }
